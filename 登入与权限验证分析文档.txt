@@ -1,0 +1,526 @@
+================================================================================
+                    登入与权限验证 — 完整流程分析文档
+================================================================================
+
+项目: ai-springboot (心理健康助手)
+技术栈: Spring Boot 3.x + Spring Security 6 + JWT (auth0-java-jwt) + MyBatis-Plus
+
+
+================================================================================
+第1章  整体架构概览
+================================================================================
+
+1.1 涉及的核心文件
+
+  [SecurityConfig.java]     Spring Security 总配置，定义哪些路径公开、哪些需认证
+  [JwtAuthticationFilter.java]  每个请求进入时的 JWT 拦截过滤器
+  [JwtTokenUtil.java]        JWT 生成/验证/解析工具类
+  [JwtConfig.java]           JWT 配置参数（密钥、过期时间等）
+  [User.java] (Controller)   登入/注册/获取当前用户的 REST 接口
+  [UserService.java]         登入/注册/查询用户的业务逻辑
+  [UserMapper.java]          MyBatis-Plus 数据库访问层
+  [User.java] (Entity)       用户实体，映射 DB 表
+  [UserConvert.java]         Entity 与 DTO 互转工具
+  [UserLoginCommandDTO.java]     登入请求体
+  [UserRegisterCommandDTO.java]  注册请求体
+  [UserLoginResponseDTO.java]    登入响应体（含 token + 用户信息）
+  [UserStatus.java]          用户状态枚举（正常/禁用）
+  [UserType.java]            用户类型枚举（普通用户/管理员）
+  [Result.java]              统一响应封装
+  [ResultCode.java]          响应状态码枚举
+  [BusinessException.java]   业务异常类
+  [GlobarExceptionHandler.java]  全局异常处理器
+  [PesponseUtil.java]        Filter 中直接写 JSON 响应的工具
+  [application.yml]          配置文件（含 JWT 参数）
+
+1.2 请求处理总流程
+
+  客户端请求
+      |
+      v
+  [Spring Security Filter Chain]
+      |
+      v
+  [JwtAuthticationFilter]  <-- 除公开路径外，每个请求都经过
+      |                        提取 token -> 验证 -> 设置 SecurityContext
+      v
+  [Controller]  (@RestController)
+      |
+      v
+  [Service]  (业务逻辑)
+      |
+      v
+  [Mapper]  (数据库操作)
+
+
+================================================================================
+第2章  登入流程 — 从 HTTP 请求到返回 Token
+================================================================================
+
+2.1 请求入口: User.java (Controller)
+
+  POST /api/user/login
+  请求体: { "username": "xxx", "password": "xxx" }
+
+  代码:
+    @PostMapping("/login")
+    public Result<UserLoginResponseDTO> login(@Valid @RequestBody UserLoginCommandDTO commandDTO) {
+        UserLoginResponseDTO result = userService.login(commandDTO);
+        return Result.ok(result);
+    }
+
+  为什么这样写:
+    - @Valid 触发 JSR-303 校验，在 DTO 层就拦截格式错误
+    - 返回 Result<T> 统一响应格式，前端不必区分成功/失败的数据结构
+    - Controller 只做参数接收和调用 Service，保持"薄 Controller"原则
+
+
+2.2 DTO 层: UserLoginCommandDTO
+
+  字段:
+    @NotBlank  username   用户名或邮箱（支持二者混登）
+    @NotBlank  password   密码（6-50字符）
+
+  为什么 username 一个字段支持用户名和邮箱：
+    - 用户体验更好，不需要切换输入模式
+    - 由 Service 层判断是用户名还是邮箱，数据库用 OR 查询
+
+
+2.3 核心业务: UserService.login()
+
+  完整流程:
+    (1) 用 MyBatis-Plus 的 LambdaQueryWrapper 构造查询
+        查询条件: username = ? OR email = ?
+        由于 SQL 注入和字段名硬编码风险，用 Lambda 表达式 .eq(User::getUsername, ...) 
+        替代字符串拼字段名，编译期就能发现字段名写错的问题
+
+    (2) 用户不存在 -> 抛出 BusinessException("用户不存在")
+
+    (3) 密码校验: BCryptPasswordEncoder.matches(明文, 密文)
+        - BCrypt 是 Spring Security 推荐的密码编码器
+        - 每次加密产生不同的盐值（盐值嵌入密文中），无法彩虹表攻击
+        - matches() 内部会自动提取密文中的盐值重新计算
+        - 注意: 对 inputPassword 做了 trim()，防止复制粘贴时带空格
+
+    (4) 状态检查: user.isActive()
+        - 调用 User 实体的 isActive() 方法
+        - 判断 status == UserStatus.NORMAL(1)
+        - 禁用的用户即使密码正确也不让登录
+
+    (5) 生成 JWT Token: JwtTokenUtil.generateToken(id, username, userType)
+        - 将 userId、username、roleType 三个关键信息打进 token
+        - 后续每个请求都能从 token 中解出这些字段，无需重复查数据库
+
+    (6) 组装响应: UserConvert.entityToLoginResponse(token, userInfo)
+        - Token 给前端保存
+        - userInfo 给前端展示用户基本信息
+
+
+2.4 JWT Token 生成: JwtTokenUtil.generateToken()
+
+  代码:
+    public static String generateToken(Long userId, String username, Integer roleType) {
+        JwtConfig jwtConfig = getJwtConfig();
+        Algorithm algorithm = Algorithm.HMAC256(jwtConfig.getSecret());
+        Date expiration = new Date(System.currentTimeMillis() + jwtConfig.getExpiration());
+        String token = JWT.create()
+                .withClaim("userId", userId)
+                .withClaim("username", username)
+                .withClaim("roleType", roleType)
+                .withExpiresAt(expiration)
+                .withIssuedAt(new Date())
+                .withIssuer("mental-health-assistant")
+                .sign(algorithm);
+        return token;
+    }
+
+  关键设计点:
+    (a) HMAC256 算法
+        - 对称加密，服务端持有一个 secret key
+        - 速度快，适合每次请求都需验证的场景
+        - 缺点: 无法像 RSA 那样做服务间验证（但本项目单服务够用）
+
+    (b) Claims 携带信息
+        - userId:  后续查数据库用
+        - username: 日志/审计用，也用于填充 SecurityContext 的 principal
+        - roleType: 权限控制核心，filter 中转为 GrantedAuthority
+
+    (c) 过期时间
+        - application.yml 配置: jwt.expiration = 86400000 ms (24小时)
+        - 过期后需重新登录
+        - 同时配了 refresh-expiration (7天)，但目前代码未使用刷新机制
+
+    (d) Issuer (签发者)
+        - 固定 "mental-health-assistant"
+        - 验证时会校验，防止其他来源的 token 被接受
+
+    (e) static 方法 + ApplicationContextAware 模式
+        - generateToken 是 static 方法，但需要注入 JwtConfig Bean
+        - 通过 ApplicationContextAware 在启动时保存 ApplicationContext
+        - getJwtConfig() 每次从容器中取 Bean
+        - 这是一个可行的工具类模式，注意前提是 Spring 单例已初始化完毕
+
+
+2.5 响应组装: UserConvert
+
+  entityToLoginResponse(token, userInfo):
+    - 把 token 和 UserDetailResponseDTO 拼在一起返回
+    - roleType 字段单独提出来方便前端做菜单/按钮权限判断
+
+  entityToDetailResponse(user):
+    - 手动 Builder 模式逐字段赋值（而非用 MapStruct/BeanUtils）
+    - 优点: 编译期类型安全，字段变更时 IDE 能追踪
+    - 密码字段不会出现在 UserDetailResponseDTO 中，天然防止泄露
+
+
+================================================================================
+第3章  注册流程
+================================================================================
+
+  POST /api/user/add
+
+  流程: UserService.register()
+    (1) 确认密码一致性校验: password.equals(confirmPassword)
+    (2) 用户名唯一性校验: 查数据库 count
+    (3) 邮箱唯一性校验: 查数据库 count
+    (4) 用户类型合法性: UserType.isValidCode()
+    (5) BCrypt 加密密码后入库
+    (6) 新用户默认状态为 NORMAL
+
+  为什么注册路径也是公开的:
+    SecurityConfig 中 /api/user/add 在 PUBLIC_PATHS 数组里，
+    因为注册时用户还没账号，不可能有 token
+
+
+================================================================================
+第4章  权限验证流程 — 请求拦截与身份认证
+================================================================================
+
+4.1 Spring Security 总配置: SecurityConfig
+
+  核心代码:
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(AbstractHttpConfigurer::disable)           // 关 CSRF
+            .sessionManagement(session -> session
+                .sessionCreationPolicy(SessionCreationPolicy.STATELESS))  // 无状态
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers(PUBLIC_PATHS).permitAll()   // 公开路径
+                .anyRequest().authenticated()                // 其余全部需认证
+            )
+            .addFilterBefore(jwtAuthenticationFilter(), 
+                UsernamePasswordAuthenticationFilter.class);  // 插入 JWT 过滤器
+        return http.build();
+    }
+
+  设计原因逐条解释:
+
+  (a) 关闭 CSRF
+      - CSRF 保护依赖 Session（服务端存储 CSRF token）
+      - 本项目使用 JWT 无状态认证，没有 Session，CSRF 保护自然无效
+      - JWT 本身也不易被 CSRF 攻击（token 在请求头而非 cookie）
+
+  (b) 无状态会话策略
+      - SessionCreationPolicy.STATELESS 告诉 Spring Security 不创建 HttpSession
+      - 每次请求独立验证 JWT，服务器不保存任何会话状态
+      - 优点: 水平扩展简单（无 Session 同步问题）
+      - 缺点: 无法实现"踢人下线"（要额外引入黑名单机制）
+
+  (c) 路径授权
+      - PUBLIC_PATHS = {"/", "/api/test", "/api/user/login", "/api/user/add"}
+      - .permitAll() = 任何人都能访问，不经过认证过滤器
+      - .anyRequest().authenticated() = 其余全部需要 token
+
+  (d) @EnableMethodSecurity
+      - 启用方法级安全注解（@PreAuthorize、@Secured 等）
+      - 当前项目未大量使用，但基础设施已就位
+
+  (e) SecurityContextHolder 策略
+      @PostConstruct
+      public void init() {
+          SecurityContextHolder.setStrategyName(
+              SecurityContextHolder.MODE_INHERITABLETHREADLOCAL);
+      }
+      - 默认 MODE_THREADLOCAL: SecurityContext 只在当前线程可用
+      - 改为 MODE_INHERITABLETHREADLOCAL: 子线程可以继承父线程的 SecurityContext
+      - 本项目用了 WebFlux 的 SSE (PsychologicalChat.stream)，涉及异步，
+        改成 INHERITABLETHREADLOCAL 确保子线程也能获取认证信息
+
+  (f) PUBLIC_PATHS 的 isPublicPATH 静态方法
+      - 提供 Ant 风格路径匹配（"/api/user/**" 这类通配符）
+      - SecurityConfig 的 requestMatchers 用于"放行"（不抛 403）
+      - JwtAuthticationFilter 的 shouldNotFilter 也调用同一方法决定"不拦截"
+      - 两处逻辑统一，防止漏配
+
+
+4.2 JWT 认证过滤器: JwtAuthticationFilter
+
+  继承: OncePerRequestFilter
+    - 保证每个请求只执行一次过滤
+    - 即使内部 forward/include 也不会重复执行
+
+  方法: shouldNotFilter(HttpServletRequest request)
+    - 调用 SecurityConfig.isPublicPATH(requestUri)
+    - 公开路径直接跳过，不执行 doFilterInternal
+    - 这是性能优化: 登入/注册请求不需要解析 token
+
+  核心方法: doFilterInternal()
+    流程如下 ——
+
+    Step 1: 提取 token
+        String token = JwtTokenUtil.extractTokenFromRequest(request);
+        - 从请求头 "token" (不是标准 "Authorization") 中取
+        - 注意: application.yml 配了 header: Authorization 和 prefix: Bearer，
+          但实际代码读的是自定义头 "token"，此处存在不一致
+        - 建议统一: 要么全用 Authorization + Bearer，要么全用自定义头
+
+    Step 2: 验证 token
+        JwtTokenUtil.TokenVerificationResult validationResult = 
+            JwtTokenUtil.validateToken(token);
+        - 调用 JWT 库验证签名 + 过期时间 + issuer
+        - 提取 userId, username, roleType
+        - 返回 null 表示无效
+
+    Step 3: 验证用户状态
+        UserLoginResponseDTO.UserDetailResponseDTO user = 
+            userService.getUserById(validationResult.getUserId());
+        if (user != null && UserStatus.NORMAL.getCode().equals(user.getStatus())) {
+            // 通过
+        }
+        - 即使 token 有效，还要查数据库确认用户没被禁用
+        - 这是"token 有效不等于用户有效"的防御设计
+        - 如果管理后台禁用了某用户，他的旧 token 还在有效期内，
+          必须靠这一步拦截
+
+    Step 4: 创建 SecurityContext
+        List<SimpleGrantedAuthority> authorities = Collections.singletonList(
+            new SimpleGrantedAuthority("ROLE_" + validationResult.getRoleType())
+        );
+        UsernamePasswordAuthenticationToken authcation = 
+            new UsernamePasswordAuthenticationToken(
+                validationResult.getUsername(), null, authorities);
+        SecurityContextHolder.getContext().setAuthentication(authcation);
+
+        - roleType (1=普通用户, 2=管理员) 转为 "ROLE_1" 或 "ROLE_2"
+        - 存入 SecurityContext 后，Spring Security 认为当前用户已认证
+        - 后续可以用 @PreAuthorize("hasRole('2')") 做方法级控制
+
+    Step 5: 失败分支处理
+        - token 为空 -> 返回 ACCESS_UNAUTHORIZED (401)
+        - token 无效 -> 返回 TOKEN_INVALID (401)
+        - 用户被禁用 -> 返回 TOKEN_ACCESS_FORBIDDEN (403)
+        - 都通过 PesponseUtil.writeError() 直接写 JSON 到响应
+        - 注意: 失败时调用了 clearSecurityContext() 清理上下文，
+          然后 return 不执行 chain.doFilter()
+
+
+4.3 Token 验证细节: JwtTokenUtil.validateToken()
+
+  代码:
+    public static TokenVerificationResult validateToken(String token) {
+        DecodedJWT jwt = verifyToken(token);   // 验证签名+过期+issuer
+        Long userId = jwt.getClaim("userId").asLong();
+        String username = jwt.getClaim("username").asString();
+        Integer roleType = null;
+        try {
+            roleType = jwt.getClaim("roleType").asInt();
+        } catch (Exception e) {
+            // 兼容字符串类型的 roleType
+            String roleTypeStr = jwt.getClaim("roleType").asString();
+            if (StringUtils.hasText(roleTypeStr)) {
+                roleType = Integer.valueOf(roleTypeStr);
+            }
+        }
+        // 三个字段都存在才返回结果
+        if (userId != null && StringUtils.hasText(username) && roleType != null) {
+            return new TokenVerificationResult(userId, username, roleType, true);
+        }
+        return null;
+    }
+
+  值得注意的细节:
+    - roleType 的双重解析: 先 asInt() 再 try asString()
+      这是因为 JWT 库对整数 Claim 以不同方式序列化时可能变字符串
+      这是生产环境的防御性编程，防止 token 版本不一致导致解析失败
+    - 返回值 null 表示校验不通过，调用方统一判断
+    - 三个字段缺一不可 —— 即使签名通过，信息不全的 token 也拒绝
+
+
+4.4 已认证接口中的 Token 使用
+
+  以 PsychologicalChat 为例:
+    @PostMapping("/session/start")
+    public Result<...> startSession(...) {
+        String token = JwtTokenUtil.getCurrentToken();
+        DecodedJWT jwt = JwtTokenUtil.verifyToken(token);
+        Long userId = jwt.getClaim("userId").asLong();
+        // 使用 userId 标识当前操作者
+    }
+
+  注意这里有两个获取 userId 的方式:
+    (1) 从 SecurityContextHolder 取: SecurityContextHolder.getContext()
+            .getAuthentication().getName()
+    (2) 从 token 中解: JwtTokenUtil.verifyToken(token).getClaim("userId")
+
+  当前项目选择了(2)，因为已经在 filter 中设置了 request.setAttribute("jwtToken", token)
+  可以通过 getCurrentToken() 拿到。这种情况下(1)和(2)都能工作，
+  但(1)更"Spring Security 标准"，可以减少对 JWT 工具类的直接依赖。
+
+
+================================================================================
+第5章  异常处理与统一响应
+================================================================================
+
+5.1 Result<T> 统一响应
+
+  所有接口返回:
+    { "code": "200", "msg": "操作成功", "data": {...} }
+
+  设计意图:
+    - 前端不需要 try-catch 区分 HTTP 状态码和业务错误码
+    - 所有响应结构一致，便于前端封装统一的请求拦截器
+    - code 使用字符串（非数字），支持 "A0230" 这样的分类编码
+
+
+5.2 ResultCode 错误码设计
+
+  分层编码:
+    2xx 开头 -> 成功
+    4xx 开头 -> 参数/权限错误
+    5xx 开头 -> 文件/系统错误
+    6xx 开头 -> 业务错误
+    A开头  -> Token/Auth 相关错误
+
+  这种方法让运维排查日志时一眼能看到错误大类
+
+
+5.3 BusinessException
+
+  继承 RuntimeException（非受检异常），代码:
+    public BusinessException(String message) {
+        super(message);
+        this.code = "BUSINESS_ERROR";
+        this.message = message;
+    }
+
+  缺少带自定义 code 的构造函数，目前所有业务异常 code 统一为 "BUSINESS_ERROR"
+  实际返回时能看到 msg 区分，但 code 层面无法区分。可以考虑增加:
+    public BusinessException(String code, String message)
+
+
+5.4 GlobarExceptionHandler (全局异常处理)
+
+  @RestControllerAdvice
+    - 拦截所有 Controller 抛出的异常
+    - 两个处理器:
+      (1) MethodArgumentNotValidException: 捕获 @Valid 校验失败
+          -> 把多个字段的校验错误消息用 ", " 拼接返回
+      (2) BusinessException: 捕获业务异常
+          -> 包装成 Result.error() 返回
+
+  未覆盖的异常:
+    - 没有兜底的 @ExceptionHandler(Exception.class)
+    - 如果抛出意料之外的异常（如 NullPointerException），
+      Spring Boot 会用默认的 /error 处理，返回 HTML 而非 JSON
+    - 建议补充一个 catch-all 处理器
+
+
+5.5 PesponseUtil (Filter 中写响应)
+
+  因为 JwtAuthticationFilter 在 Controller 之前执行，
+  不能依赖 @RestControllerAdvice 捕获异常，
+  所以需要直接在 HttpServletResponse 中写 JSON 响应。
+
+  writeError() 做的事:
+    1. 根据错误类型设置 HTTP 状态码:
+       401 Unauthorized  -> 未登录/token过期
+       403 Forbidden     -> 用户被禁用
+       400 Bad Request   -> 其他
+    2. 设置 Content-Type: application/json
+    3. 把 Result.error() 转为 JSON 字符串写入响应体
+
+
+================================================================================
+第6章  配置说明
+================================================================================
+
+  application.yml 中 JWT 段:
+    jwt:
+      secret: [REDACTED]
+      expiration: 86400000          # 24小时
+      refresh-expiration: 604800000 # 7天（未使用）
+      header: Authorization
+      token-prefix: "Bearer "
+
+  注意: header 和 token-prefix 配置了但代码没用
+    - JwtTokenUtil.extractTokenFromRequest() 读的是 request.getHeader("token")
+    - 不是配置中的 "Authorization"
+    - 如果以后要标准化，需要统一修改
+
+
+================================================================================
+第7章  完整请求时序总结
+================================================================================
+
+  【登入请求】
+  客户端 -> POST /api/user/login {username, password}
+       -> JwtAuthticationFilter.shouldNotFilter() 返回 true，跳过拦截
+       -> User.login() Controller
+       -> UserService.login()
+           1. 查数据库 (username 或 email)
+           2. BCrypt 验证密码
+           3. 检查用户状态
+           4. JwtTokenUtil.generateToken() 生成 JWT
+           5. UserConvert 组装响应
+       -> 返回 {code:"200", data:{token:"...", userInfo:{...}}}
+
+  【需要认证的请求】
+  客户端 -> POST /api/psychological-chat/session/start  (Header: token: xxx)
+       -> JwtAuthticationFilter.doFilterInternal()
+           1. extractTokenFromRequest() 取出 token
+           2. validateToken() 验证签名
+           3. getUserById() 验证用户未被禁用
+           4. 设置 SecurityContext (认证信息)
+       -> PsychologicalChat.startSession()
+           1. getCurrentToken() 获取当前 token
+           2. verifyToken() 解出 userId
+           3. 执行业务逻辑
+       -> 返回 Result
+
+  【无 token 的受保护请求】
+  客户端 -> GET /api/some-protected-path  (无 token)
+       -> JwtAuthticationFilter.doFilterInternal()
+           token 为空 -> writeError(401)
+       -> 请求终止，不进入 Controller
+
+
+================================================================================
+第8章  设计评价与改进建议
+================================================================================
+
+  做得好的:
+    1. BCrypt 加密，密码不明文存储
+    2. token 过期 + 用户状态双重验证，已禁用用户无法继续使用旧 token
+    3. 统一的 Result 响应和 ResultCode 错误码体系
+    4. LambdaQueryWrapper 防字段名拼写错误
+    5. DTO 层 @Valid 参数校验 + 全局异常处理器统一处理
+    6. INHERITABLETHREADLOCAL 策略，兼容异步场景
+    7. token 中只存 userId/username/roleType 三个轻量字段，不存敏感信息
+
+  可改进的:
+    1. JWT secret 硬编码在 yml 中，应改用环境变量或配置中心
+    2. token 请求头命名不统一 (代码用 "token"，yml 配 "Authorization")
+    3. 缺少 refresh token 机制的实际使用
+    4. 没有全局兜底异常处理器
+    5. BusinessException 缺少自定义 code 的构造函数
+    6. Token 没有退出/黑名单机制（无法主动让 token 失效）
+    7. 密码 trim() 只在登录做，注册时没有 trim 处理
+    8. Controller 命名不规范: User.java 与实体类 Entity 同名
+       (Controller 建议命名为 UserController.java)
+    9. 文件名拼写错误: PesponseUtil.java 应为 ResponseUtil
+       GlobarExceptionHandler.java 应为 GlobalExceptionHandler
+
+================================================================================
+                              (文档结束)
+================================================================================
